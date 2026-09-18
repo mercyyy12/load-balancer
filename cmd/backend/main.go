@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -34,30 +33,25 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-
 	backend := Backend{
-		Port: port,
+		Port: os.Getenv("PORT"),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", backend.handleRoot)
 
 	srv := &http.Server{
-		Addr:    ":" + port,
+		Addr:    ":" + backend.Port,
 		Handler: mux,
 	}
 
-	slog.Info("Backend server starting...", "port", port)
+	slog.Info("Backend server starting...", "port", backend.Port)
 
 	go func() {
 		err := srv.ListenAndServe()
 		if err != nil && err != http.ErrServerClosed {
 			slog.Error("Failed to start server", "err", err.Error())
-			log.Fatal(err)
+			os.Exit(1)
 		}
 	}()
 
