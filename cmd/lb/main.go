@@ -8,44 +8,44 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
+
+	"github.com/mercyyy12/load-balancer/internal/health"
+	"github.com/mercyyy12/load-balancer/internal/loadbalancer"
 )
 
-type Targets struct {
-	Urls []string
-}
-
-type Pool struct {
-	proxies []*httputil.ReverseProxy
-	Counter int
-}
-
-func (p *Pool) homePage(w http.ResponseWriter, r *http.Request) {
-	proxy := p.proxies[p.Counter%len(p.proxies)]
-	p.Counter++
-	proxy.ServeHTTP(w, r)
-}
-
 func main() {
-	var poolProxy Pool
+	var poolProxy loadbalancer.Pool
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
-	urls := &Targets{
-		Urls: []string{"http://localhost:8081", "http://localhost:8082", "http://localhost:8083"},
+	// Read backend URLs from environment variables
+	backendUrlString := os.Getenv("BACKENDS")
+	if backendUrlString == "" {
+		backendUrlString = "http://localhost:8081,http://localhost:8082,http://localhost:8083"
 	}
+	rawUrls := strings.Split(backendUrlString, ",")
+
+	// Initialize the Server Pool nd create a ReverseProxy for it
 	poolProxy.Counter = 0
-	for _, v := range urls.Urls {
+	for _, v := range rawUrls {
 		target, err := url.Parse(v)
 		if err != nil {
 			slog.Error("Url parsing went wrong", "err", err)
 			os.Exit(1)
 		}
-		proxy := httputil.NewSingleHostReverseProxy(target)
-		poolProxy.proxies = append(poolProxy.proxies, proxy)
 
+		backendPool := &loadbalancer.Backend{
+			Alive: true, // Assume servers are healthy
+			Proxy: httputil.NewSingleHostReverseProxy(target),
+			URL:   target,
+		}
+		poolProxy.Backends = append(poolProxy.Backends, backendPool)
 	}
+
+	// Create the HTTP router for the Load Balancer
 	mux := http.NewServeMux()
 
 	port := os.Getenv("PORT")
@@ -58,20 +58,36 @@ func main() {
 		Handler: mux,
 	}
 
-	mux.HandleFunc("/", poolProxy.homePage)
+	// Route ALL incoming traffic ("/") to our Round-Robin load balancing logic
+	mux.HandleFunc("/", poolProxy.HomePage)
 
+	// a background Goroutine that acts as our Active Health Checker
+	// wakes up every 10 seconds, pings the servers, and updates it's status
 	go func() {
-		err := srv.ListenAndServe()
-		if err != nil && err != http.ErrServerClosed {
-			slog.Error("Failed tp start a server", "err", err)
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			<-ticker.C
+			health.CheckHealth(&poolProxy)
+		}
+	}()
+
+	// Start the main Load Balancer web server in the background
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("Failed to start server", "err", err)
 			os.Exit(1)
 		}
 	}()
 
+	// Graceful Shutdown logic:
+	// We freeze the main function here and wait until the OS sends an interrupt
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, os.Interrupt)
-	<-quit
+	<-quit // Blocks until interrupted
 
+	// Once interrupted, give the server 5 seconds to finish any active user requests before dying
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
